@@ -1,119 +1,169 @@
-"""modules/01_capture.py  —  vinny-stack CAPTURE stage
+"""modules/01_capture.py  —  vinny-stack stage 01: CAPTURE
 
-Ingest raw input from:
-  - Local file path (any MIME type)
-  - URL (fetched with requests, text extracted)
-  - Clipboard text (macOS pbpaste)
-  - Raw string passed directly via artifact['raw_text']
+Ingests raw input from:
+  - Local file path (text, image, PDF, any binary)
+  - HTTP/HTTPS URL (downloads with requests)
+  - Clipboard text (macOS pbpaste / pyperclip)
+  - Stdin (piped input)
+  - Raw string passed directly in artifact['input_path']
 
-Outputs:
-  artifact['raw_text']    : str  — extracted text content
-  artifact['mime_type']   : str  — detected MIME type
-  artifact['source_type'] : str  — 'file' | 'url' | 'clipboard' | 'raw'
-  artifact['source_path'] : str  — original path or URL
+Outputs artifact fields:
+  raw_bytes   bytes       Raw content of the input
+  raw_text    str | None  Decoded text (if UTF-8 decodable)
+  mime        str         Detected MIME type
+  source_type str         'file' | 'url' | 'clipboard' | 'stdin' | 'raw'
+  source_path str         Original input path/URL
+  filename    str         Basename of the source
+  size_bytes  int         Byte length of raw_bytes
 """
 from __future__ import annotations
 
 import mimetypes
-import subprocess
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from _brain_client import emit_stage
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _brain_client import emit_stage  # noqa: E402
 
 
-def _detect_mime(path: str) -> str:
-    mime, _ = mimetypes.guess_type(path)
-    return mime or "application/octet-stream"
+# ---------------------------------------------------------------------------
+# MIME detection
+# ---------------------------------------------------------------------------
 
-
-def _read_file(path: str) -> tuple[str, str]:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"capture: file not found: {path}")
-    mime = _detect_mime(path)
-    if mime and mime.startswith("text/"):
-        return p.read_text(errors="replace"), mime
-    if mime in ("application/json", "application/yaml", "application/toml"):
-        return p.read_text(errors="replace"), mime
-    # Binary — return placeholder; OCR stage handles images/PDFs
-    return f"[binary:{mime}:{p.stat().st_size}bytes]", mime
-
-
-def _fetch_url(url: str) -> tuple[str, str]:
+def _detect_mime(data: bytes, filename: str) -> str:
+    mime, _ = mimetypes.guess_type(filename)
+    if mime:
+        return mime
+    # Sniff first bytes
+    sig = data[:8]
+    if sig[:4] == b'%PDF':
+        return 'application/pdf'
+    if sig[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'image/png'
+    if sig[:2] in (b'\xff\xd8', ):
+        return 'image/jpeg'
+    if sig[:4] in (b'GIF8', ):
+        return 'image/gif'
+    if sig[:2] in (b'PK', ):
+        return 'application/zip'
     try:
-        import requests
-        r = requests.get(url, timeout=30, headers={"User-Agent": "vinny-stack/1.0"})
+        data.decode('utf-8')
+        return 'text/plain'
+    except UnicodeDecodeError:
+        return 'application/octet-stream'
+
+
+# ---------------------------------------------------------------------------
+# Source handlers
+# ---------------------------------------------------------------------------
+
+def _from_url(url: str) -> bytes:
+    try:
+        import requests  # type: ignore
+        r = requests.get(url, timeout=30, headers={'User-Agent': 'vinny-stack/1.0'})
         r.raise_for_status()
-        ct = r.headers.get("content-type", "text/html")
-        mime = ct.split(";")[0].strip()
-        # Strip HTML tags crudely for now; extract stage refines later
-        text = r.text
-        if "html" in mime:
-            import re
-            text = re.sub(r"<[^>]+>", " ", text)
-            text = re.sub(r"\s+", " ", text).strip()
-        return text[:50_000], mime  # cap at 50k chars
+        return r.content
     except Exception as e:
-        raise RuntimeError(f"capture: URL fetch failed for {url}: {e}")
+        raise RuntimeError(f'[capture] URL fetch failed: {e}') from e
 
 
-def _read_clipboard() -> str:
+def _from_clipboard() -> bytes:
+    # Try macOS pbpaste first, then pyperclip
     try:
-        result = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
-        return result.stdout or ""
+        import subprocess
+        result = subprocess.run(['pbpaste'], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            return result.stdout or result.stdout  # may be empty bytes
+    except Exception:
+        pass
+    try:
+        import pyperclip  # type: ignore
+        return pyperclip.paste().encode('utf-8')
     except Exception as e:
-        raise RuntimeError(f"capture: clipboard read failed: {e}")
+        raise RuntimeError(f'[capture] Clipboard read failed: {e}') from e
 
 
-def run(artifact: Dict[str, Any], run_id: str = "") -> Dict[str, Any]:
-    """
-    CAPTURE stage entry point.
+def _from_stdin() -> bytes:
+    if sys.stdin.isatty():
+        raise RuntimeError('[capture] stdin requested but no piped input detected')
+    return sys.stdin.buffer.read()
 
-    Reads from artifact['input_path']:
-      - 'clipboard'        → reads macOS clipboard
-      - URL (http/https)   → fetches and strips HTML
-      - file path          → reads text content
-    Or passes through artifact['raw_text'] if already set.
-    """
-    input_path = artifact.get("input_path", "")
-    raw_text   = artifact.get("raw_text", "")
 
-    source_type = "raw"
-    mime_type   = "text/plain"
+# ---------------------------------------------------------------------------
+# Main run()
+# ---------------------------------------------------------------------------
+
+def run(artifact: Dict[str, Any], run_id: str = '') -> Dict[str, Any]:
+    input_path: str = artifact.get('input_path', '')
+    outcome = 'pass'
+    detail = ''
 
     try:
-        if raw_text:
-            source_type = "raw"
-        elif input_path == "clipboard":
-            raw_text   = _read_clipboard()
-            source_type = "clipboard"
-        elif input_path.startswith(("http://", "https://")):
-            raw_text, mime_type = _fetch_url(input_path)
-            source_type = "url"
-        elif input_path:
-            raw_text, mime_type = _read_file(input_path)
-            source_type = "file"
+        raw_bytes: bytes
+        source_type: str
+        filename: str
+
+        if not input_path or input_path == '__clipboard__':
+            raw_bytes = _from_clipboard()
+            source_type = 'clipboard'
+            filename = 'clipboard.txt'
+
+        elif input_path == '__stdin__':
+            raw_bytes = _from_stdin()
+            source_type = 'stdin'
+            filename = 'stdin.txt'
+
+        elif input_path.startswith(('http://', 'https://')):
+            raw_bytes = _from_url(input_path)
+            source_type = 'url'
+            # Derive filename from URL path
+            from urllib.parse import urlparse
+            parsed = urlparse(input_path)
+            filename = Path(parsed.path).name or 'downloaded'
+            if '.' not in filename:
+                filename += '.html'
+
+        elif Path(input_path).exists():
+            raw_bytes = Path(input_path).read_bytes()
+            source_type = 'file'
+            filename = Path(input_path).name
+
         else:
-            raise ValueError("capture: no input_path or raw_text provided")
+            # Treat as raw string content
+            raw_bytes = input_path.encode('utf-8')
+            source_type = 'raw'
+            filename = 'raw_input.txt'
+
+        mime = _detect_mime(raw_bytes, filename)
+
+        # Attempt text decode
+        raw_text: str | None = None
+        if mime.startswith('text/') or mime == 'application/json':
+            try:
+                raw_text = raw_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                pass
 
         artifact.update({
-            "raw_text":    raw_text,
-            "mime_type":   mime_type,
-            "source_type": source_type,
-            "source_path": input_path,
+            'raw_bytes':   raw_bytes,
+            'raw_text':    raw_text,
+            'mime':        mime,
+            'source_type': source_type,
+            'source_path': input_path,
+            'filename':    filename,
+            'size_bytes':  len(raw_bytes),
         })
 
-        emit_stage(
-            run_id=run_id, stage_name="capture", outcome="pass",
-            detail=f"source_type={source_type} mime={mime_type} chars={len(raw_text)}",
-        )
-        print(f"  [capture] ✓ source={source_type} mime={mime_type} chars={len(raw_text)}")
+        detail = f'source={source_type} mime={mime} size={len(raw_bytes)}'
+        print(f'    source={source_type} filename={filename} mime={mime} size={len(raw_bytes):,}b')
 
     except Exception as exc:
-        emit_stage(run_id=run_id, stage_name="capture", outcome="fail", detail=str(exc)[:200])
-        raise
+        outcome = 'fail'
+        detail = str(exc)[:200]
+        artifact['capture_error'] = detail
+        print(f'    ERROR: {exc}')
 
+    emit_stage(run_id=run_id, stage_name='capture', outcome=outcome, detail=detail)
     return artifact
